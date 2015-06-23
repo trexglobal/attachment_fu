@@ -251,15 +251,14 @@ module Technoweenie # :nodoc:
 
         # The pseudo hierarchy containing the file relative to the bucket name
         # Example: <tt>:table_name/:id</tt>
-        def base_path(thumbnail = nil)
-          file_system_path = (thumbnail ? thumbnail_class : self).attachment_options[:path_prefix]
-          File.join(file_system_path, attachment_path_id)
+        def base_path
+          File.join(attachment_options[:path_prefix], attachment_path_id)
         end
 
         # The full path to the file relative to the bucket name
         # Example: <tt>:table_name/:id/:filename</tt>
         def full_filename(thumbnail = nil)
-          File.join(base_path(thumbnail), thumbnail_name_for(thumbnail))
+          File.join(base_path, thumbnail_name_for(thumbnail))
         end
 
         # All public objects are accessible via a GET request to the S3 servers. You can generate a
