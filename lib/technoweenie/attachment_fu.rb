@@ -117,7 +117,7 @@ module Technoweenie # :nodoc:
         attachment_options[:storage]     ||= parent_options[:storage]
         attachment_options[:path_prefix] ||= attachment_options[:file_system_path]
         if attachment_options[:path_prefix].nil?
-          attachment_options[:path_prefix] = case attachment_options[:storage]
+          attachment_options[:path_prefix] = case attachment_options[:storage].to_sym
             when :s3 then table_name
             when :cloud_files then table_name
             else File.join("public", table_name)
