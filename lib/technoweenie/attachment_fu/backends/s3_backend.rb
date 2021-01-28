@@ -196,7 +196,11 @@ module Technoweenie # :nodoc:
           end
           base.class_eval(eval_string, __FILE__, __LINE__)
 
-          @@s3_conn = AWS::S3.new(s3_config.slice(:access_key_id, :secret_access_key))
+          if EnvironmentHelper.get_installed_environment == 'development'
+            @@s3_conn = AWS::S3.new(s3_config.slice(:access_key_id, :secret_access_key))
+          else
+            @@s3_conn = AWS::S3.new
+          end
           @@bucket = s3_conn.buckets[s3_config[:bucket_name]]
 
           #Base.establish_connection!(s3_config.slice(:access_key_id, :secret_access_key, :server, :port, :use_ssl, :persistent, :proxy))
