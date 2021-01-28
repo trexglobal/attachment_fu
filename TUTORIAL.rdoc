@@ -236,13 +236,11 @@ follows:
 
  development:
    bucket_name: your_bucket_name
-   access_key_id: your_access_key_id
-   secret_access_key: your_secret_access_key
+   access_key_id: your_access_key_id # OPTIONAL: If not provided, AWS Instance profile role will be used.
+   secret_access_key: your_secret_access_key # OPTIONAL: If not provided, AWS Instance profile role will be used.
 
  test:
-   bucket_name:
-   access_key_id:
-   secret_access_key:
+   bucket_name:   
 
  production:
    bucket_name:

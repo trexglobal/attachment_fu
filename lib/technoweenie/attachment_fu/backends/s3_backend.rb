@@ -28,15 +28,11 @@ module Technoweenie # :nodoc:
       #     distribution_domain: XXXX.cloudfront.net
       #
       #   test:
-      #     bucket_name: appname_test
-      #     access_key_id: <your key>
-      #     secret_access_key: <your key>
+      #     bucket_name: appname_test      
       #     distribution_domain: XXXX.cloudfront.net
       #
       #   production:
-      #     bucket_name: appname
-      #     access_key_id: <your key>
-      #     secret_access_key: <your key>
+      #     bucket_name: appname      
       #     distribution_domain: XXXX.cloudfront.net
       #
       # You can change the location of the config path by passing a full path to the :s3_config_path option.
@@ -45,8 +41,8 @@ module Technoweenie # :nodoc:
       #
       # === Required configuration parameters
       #
-      # * <tt>:access_key_id</tt> - The access key id for your S3 account. Provided by Amazon.
-      # * <tt>:secret_access_key</tt> - The secret access key for your S3 account. Provided by Amazon.
+      # * <tt>:access_key_id</tt> - OPTIONAL The access key id for your S3 account. Provided by Amazon. If none provided, it will try to use AWS EC2 instance profile role.
+      # * <tt>:secret_access_key</tt> - OPTIONAL The secret access key for your S3 account. Provided by Amazon. If none provided, it will try to use AWS EC2 instance profile role.
       # * <tt>:bucket_name</tt> - A unique bucket name (think of the bucket_name as being like a database name).
       #
       # If any of these required arguments is missing, a MissingAccessKey exception will be raised from AWS::S3.
@@ -182,7 +178,7 @@ module Technoweenie # :nodoc:
 
           begin
             @@s3_config_path = base.attachment_options[:s3_config_path] || File.join(Rails.root, 'config', 'amazon_s3.yml')
-            @@s3_config = @@s3_config = YAML.load(ERB.new(File.read(@@s3_config_path)).result)[Rails.env].symbolize_keys
+            @@s3_config = YAML.load(ERB.new(File.read(@@s3_config_path)).result)[Rails.env].symbolize_keys
           #rescue
           #  raise ConfigFileNotFoundError.new('File %s not found' % @@s3_config_path)
           end
@@ -196,7 +192,7 @@ module Technoweenie # :nodoc:
           end
           base.class_eval(eval_string, __FILE__, __LINE__)
 
-          if EnvironmentHelper.get_installed_environment == 'development'
+          if s3_config[:access_key_id]
             @@s3_conn = AWS::S3.new(s3_config.slice(:access_key_id, :secret_access_key))
           else
             @@s3_conn = AWS::S3.new
