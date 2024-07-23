@@ -181,9 +181,19 @@ module Technoweenie # :nodoc:
       delegate :content_types, :to => ::Technoweenie::AttachmentFu
 
       # Performs common validations for attachment models.
-      def validates_as_attachment
-        validates_presence_of :size, :content_type, :filename
-        validate              :attachment_attributes_valid?
+      def validates_as_attachment(**condition)
+        if condition[:if]
+          # Apply validations if the condition[:if] is true
+          validates_presence_of :size, :content_type, :filename, if: condition[:if]
+          validate :attachment_attributes_valid?, if: condition[:if]
+        elsif condition[:unless]
+          # Apply validations if the condition[:unless] is false
+          validates_presence_of :size, :content_type, :filename, unless: condition[:unless]
+          validate :attachment_attributes_valid?, unless: condition[:unless]
+        else
+          validates_presence_of :size, :content_type, :filename
+          validate              :attachment_attributes_valid?
+        end
       end
 
       # Returns true or false if the given content type is recognized as an image.
