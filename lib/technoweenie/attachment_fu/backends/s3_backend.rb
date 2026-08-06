@@ -163,9 +163,34 @@ module Technoweenie # :nodoc:
       #
       # If you set :cloudfront to true in your model, the public_filename will be the CloudFront
       # URL, not the S3 URL.
+      #
+      # === Adopting a direct-to-S3 upload
+      #
+      # If your app uploads files straight from the browser to S3 (bypassing the app server),
+      # use authenticated_s3_post to issue the browser a presigned POST policy, then
+      # save_from_temp_key! to promote the resulting object into this record's canonical
+      # full_filename via a server-side copy -- no file bytes pass through the app server on
+      # either leg.
+      #
+      #   post = Photo.new.authenticated_s3_post(temp_key)
+      #   # ... browser POSTs the file straight to S3 using `post` ...
+      #   photo = Photo.new
+      #   photo.save_from_temp_key!(temp_key, :filename => params[:filename])
+      #
+      # By default the temp upload lives under the <tt>tmp/</tt> prefix in this model's own
+      # bucket. Customize this with <tt>:temp_path_prefix</tt>, <tt>:temp_bucket_name</tt>
+      # (for a distinct bucket), <tt>:temp_max_size</tt>, <tt>:temp_expires_in</tt>, and
+      # <tt>:temp_scanner</tt> (an optional callable run against the S3 object before adoption):
+      #
+      #   class Photo < ActiveRecord::Base
+      #     has_attachment :storage => :s3, :temp_bucket_name => 'appname_uploads',
+      #       :temp_max_size => 10.megabytes, :temp_expires_in => 300
+      #   end
       module S3Backend
         class RequiredLibraryNotFoundError < StandardError; end
         class ConfigFileNotFoundError < StandardError; end
+        class TempKeyNotFoundError < StandardError; end
+        class TempUploadRejectedError < StandardError; end
 
         def self.included(base) #:nodoc:
           mattr_reader :bucket_name, :s3_config, :s3_conn, :bucket
@@ -261,6 +286,17 @@ module Technoweenie # :nodoc:
           File.join(base_path, thumbnail_name_for(thumbnail))
         end
 
+        # The bucket that a temp upload (see save_from_temp_key!) is read from.
+        # Defaults to this model's own bucket. Set the <tt>:temp_bucket_name</tt>
+        # option to adopt uploads from a distinct bucket instead:
+        #
+        #   class Photo < ActiveRecord::Base
+        #     has_attachment :storage => :s3, :temp_bucket_name => 'appname_uploads'
+        #   end
+        def temp_bucket
+          attachment_options[:temp_bucket_name] ? s3_conn.buckets[attachment_options[:temp_bucket_name]] : bucket
+        end
+
         # All public objects are accessible via a GET request to the S3 servers. You can generate a
         # url for an object using the s3_url method.
         #
@@ -330,6 +366,103 @@ module Technoweenie # :nodoc:
           bucket.objects[full_filename(thumbnail)].url_for(:read, options).to_s
         end
 
+        # Issues a presigned POST policy so a browser can upload a file
+        # straight to S3, under attachment_options[:temp_path_prefix]
+        # (default "tmp") in temp_bucket -- no file bytes pass through the
+        # app server on this leg. Pair with save_from_temp_key! once the
+        # browser reports the temp_key back to the app.
+        #
+        # The policy enforces a content-length-range fed by the
+        # <tt>:max_size</tt> option, falling back to
+        # attachment_options[:temp_max_size], falling back in turn to
+        # attachment_options[:max_size] -- the same size cap the record's
+        # own <tt>:size</tt> validation already enforces (and, like
+        # <tt>:max_size</tt> itself, always set by has_attachment, so this
+        # never ends up unbounded). There's no reason to let the dock
+        # accept something bigger than the final record would ever
+        # validate anyway.
+        #
+        # Expiry is fed by the <tt>:expires_in</tt> option, falling back to
+        # attachment_options[:temp_expires_in] (default 900 seconds).
+        #
+        #   Photo.new.authenticated_s3_post(temp_key)
+        #   Photo.new.authenticated_s3_post(temp_key, :expires_in => 300)
+        #
+        # NOTE: verify the option names below against the installed
+        # aws-sdk-v1 version's AWS::S3::Bucket#presigned_post -- this is
+        # new SDK surface for this file (everything else here only ever
+        # calls url_for/write/copy_from/read/delete).
+        def authenticated_s3_post(temp_key, options = {})
+          max_size = options[:max_size] || attachment_options[:temp_max_size] || attachment_options[:max_size]
+
+          temp_full_filename = File.join(attachment_options[:temp_path_prefix], temp_key)
+          temp_bucket.presigned_post(
+            :key                  => temp_full_filename,
+            :content_length_range => 1..max_size,
+            :expires              => Time.now + (options[:expires_in] || attachment_options[:temp_expires_in])
+          )
+        end
+
+        # Batch form of authenticated_s3_post for uploading several files at
+        # once -- issues one independently-scoped policy per temp_key (own
+        # key, own expiry; nothing shared between them). Returns a Hash of
+        # temp_key => post.
+        #
+        #   Photo.new.authenticated_s3_posts(temp_keys, :max_size => 10.megabytes)
+        def authenticated_s3_posts(temp_keys, options = {})
+          temp_keys.each_with_object({}) do |temp_key, posts|
+            posts[temp_key] = authenticated_s3_post(temp_key, options)
+          end
+        end
+
+        # Promotes an already-uploaded, DB-less S3 object at temp_key --
+        # e.g. a raw key from a direct-to-S3 upload made via
+        # authenticated_s3_post -- into this record's canonical
+        # full_filename via a server-side copy_file. No file bytes pass
+        # through the app server.
+        #
+        # temp_key is relative to attachment_options[:temp_path_prefix]
+        # and is read from temp_bucket, which may be a distinct bucket
+        # from this model's own (see temp_bucket). content_type and size
+        # are always read back from S3 rather than trusted from the
+        # caller.
+        #
+        # Once the copy succeeds, the temp key is deleted best-effort: a
+        # delete failure at that point doesn't roll back an otherwise
+        # successful adoption (the record's saved and the file's at its
+        # permanent key) -- it's logged and left for the bucket's
+        # lifecycle rule to clean up instead.
+        #
+        #   photo = Photo.new
+        #   photo.save_from_temp_key!(params[:temp_key], :filename => params[:filename])
+        def save_from_temp_key!(temp_key, options = {})
+          old_full_filename = File.join(attachment_options[:temp_path_prefix], temp_key)
+          old_obj = temp_bucket.objects[old_full_filename]
+          raise TempKeyNotFoundError, "#{temp_bucket.name}/#{old_full_filename}" unless old_obj.exists?
+
+          if attachment_options[:temp_scanner] && !attachment_options[:temp_scanner].call(old_obj)
+            raise TempUploadRejectedError, old_full_filename
+          end
+
+          self.filename     = options[:filename]
+          self.content_type = old_obj.content_type
+          self.size         = old_obj.content_length
+          save!
+
+          copy_file(old_full_filename, full_filename, temp_bucket)
+
+          begin
+            old_obj.delete
+          rescue => delete_error
+            Rails.logger.warn("attachment_fu: adopted #{old_full_filename} but failed to delete the temp key: #{delete_error.message}") if Rails.logger
+          end
+
+          true
+        rescue
+          destroy
+          raise
+        end
+
         def create_temp_file
           write_to_temp_file current_data
         end
@@ -369,8 +502,21 @@ module Technoweenie # :nodoc:
             return unless @old_filename && @old_filename != filename
 
             old_full_filename = File.join(base_path, @old_filename)
-            old_obj = bucket.objects[old_full_filename]
-            obj = bucket.objects[full_filename]
+            copy_file(old_full_filename)
+            bucket.objects[old_full_filename].delete
+
+            @old_filename = nil
+            true
+          end
+
+          # Performs a server-side S3 copy from old_full_filename to
+          # new_full_filename, honoring the same cache_control/acl/encryption
+          # options as save_to_storage. source_bucket lets the source object
+          # live in a bucket other than this model's own (see temp_bucket) --
+          # shared by rename_file and save_from_temp_key!.
+          def copy_file(old_full_filename, new_full_filename = full_filename, source_bucket = bucket)
+            old_obj = source_bucket.objects[old_full_filename]
+            obj = bucket.objects[new_full_filename]
 
             if attachment_options[:encrypted_storage]
               obj.copy_from(old_obj, {:cache_control => attachment_options[:cache_control],
@@ -382,9 +528,7 @@ module Technoweenie # :nodoc:
                                       :acl => attachment_options[:s3_access]})
             end
 
-            old_obj.delete
-            @old_filename = nil
-            true
+            obj
           end
 
           def save_to_storage

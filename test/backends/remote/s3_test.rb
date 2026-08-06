@@ -94,6 +94,81 @@ class S3Test < Test::Unit::TestCase
 
     test_against_subclass :test_should_delete_attachment_from_s3_when_attachment_record_destroyed, S3Attachment
 
+    def test_temp_bucket_defaults_to_own_bucket(klass = S3Attachment)
+      attachment_model klass
+      assert_equal klass.new.bucket_name, klass.new.temp_bucket.name
+    end
+
+    test_against_subclass :test_temp_bucket_defaults_to_own_bucket, S3Attachment
+
+    def test_should_save_from_temp_key(klass = S3Attachment)
+      attachment_model klass
+      temp_key = "test-upload-#{Process.pid}-#{rand(1_000_000)}"
+
+      attachment = attachment_model.new
+      temp_full_filename = File.join(attachment.attachment_options[:temp_path_prefix], temp_key)
+      attachment.temp_bucket.objects[temp_full_filename].write(
+        :file => File.open(File.join(FIXTURE_PATH, 'files', 'rails.png')),
+        :acl  => :public_read
+      )
+
+      assert_created do
+        attachment.save_from_temp_key!(temp_key, :filename => 'rails.png')
+      end
+
+      assert_equal 'rails.png', attachment.filename
+      assert_equal 'image/png', attachment.content_type
+      assert !attachment.size.zero?
+      assert_kind_of Net::HTTPOK, http_response_for(attachment.s3_url)
+      assert !attachment.temp_bucket.objects[temp_full_filename].exists?,
+        "temp key should be deleted once adopted"
+    end
+
+    test_against_subclass :test_should_save_from_temp_key, S3Attachment
+
+    def test_should_raise_when_temp_key_missing(klass = S3Attachment)
+      attachment_model klass
+      attachment = attachment_model.new
+      assert_not_created do
+        assert_raise(Technoweenie::AttachmentFu::Backends::S3Backend::TempKeyNotFoundError) do
+          attachment.save_from_temp_key!('does-not-exist', :filename => 'rails.png')
+        end
+      end
+    end
+
+    test_against_subclass :test_should_raise_when_temp_key_missing, S3Attachment
+
+    # NOTE: exercises new SDK surface (AWS::S3::Bucket#presigned_post) that
+    # nothing else in this file calls -- if this fails, check the installed
+    # aws-sdk-v1 version's presigned_post option names first.
+    def test_should_create_authenticated_s3_post(klass = S3Attachment)
+      attachment_model klass
+      temp_key = "test-post-#{Process.pid}-#{rand(1_000_000)}"
+      post = attachment_model.new.authenticated_s3_post(temp_key, :max_size => 5.megabytes)
+      assert post, "authenticated_s3_post returned nil"
+    end
+
+    test_against_subclass :test_should_create_authenticated_s3_post, S3Attachment
+
+    def test_should_create_authenticated_s3_posts_in_batch(klass = S3Attachment)
+      attachment_model klass
+      temp_keys = (1..3).map { |n| "test-post-#{Process.pid}-#{n}-#{rand(1_000_000)}" }
+      posts = attachment_model.new.authenticated_s3_posts(temp_keys, :max_size => 5.megabytes)
+
+      assert_equal temp_keys.sort, posts.keys.sort
+      posts.each_value { |post| assert post, "authenticated_s3_post returned nil" }
+    end
+
+    test_against_subclass :test_should_create_authenticated_s3_posts_in_batch, S3Attachment
+
+    def test_authenticated_s3_post_falls_back_to_attachment_max_size(klass = S3Attachment)
+      attachment_model klass
+      post = attachment_model.new.authenticated_s3_post('some-temp-key')
+      assert post, "authenticated_s3_post should fall back to attachment_options[:max_size] rather than requiring :temp_max_size"
+    end
+
+    test_against_subclass :test_authenticated_s3_post_falls_back_to_attachment_max_size, S3Attachment
+
     protected
       def http_response_for(url)
         url = URI.parse(url)
