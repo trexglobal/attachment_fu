@@ -199,13 +199,15 @@ module Technoweenie # :nodoc:
           #  raise ConfigFileNotFoundError.new('File %s not found' % @@s3_config_path)
           end
 
-          # Precedence for all three: explicit has_attachment option on this model, then an
-          # app-wide default from amazon_s3.yml, then the gem's own literal fallback. A model that
-          # sets any of these explicitly keeps its own value -- ||= is a no-op there since
-          # self.attachment_options = options (in has_attachment) already set it before this runs.
+          # Precedence for all four: explicit has_attachment option on this model, then an
+          # app-wide default from amazon_s3.yml, then the gem's own literal fallback (none for
+          # temp_bucket_name/temp_max_size). A model that sets any of these explicitly keeps its
+          # own value -- ||= is a no-op there since self.attachment_options = options (in
+          # has_attachment) already set it before this runs.
           base.attachment_options[:temp_bucket_name] ||= s3_config[:temp_bucket_name]
           base.attachment_options[:temp_path_prefix] ||= s3_config[:temp_path_prefix] || 'tmp'
           base.attachment_options[:temp_expires_in]  ||= s3_config[:temp_expires_in] || 900
+          base.attachment_options[:temp_max_size]    ||= s3_config[:temp_max_size]
 
           bucket_key = base.attachment_options[:bucket_key]
 
@@ -371,10 +373,10 @@ module Technoweenie # :nodoc:
         # README.rdoc for usage and options.
         #
         # max_size falls back through :temp_max_size (this model's own option, or an app-wide
-        # default from amazon_s3.yml's temp_max_size key) to :max_size -- the dock never accepts
-        # more than the final record would validate anyway.
+        # default from amazon_s3.yml's temp_max_size key, merged in above) to :max_size -- the
+        # dock never accepts more than the final record would validate anyway.
         def authenticated_s3_post(temp_key, options = {})
-          max_size = options[:max_size] || attachment_options[:temp_max_size] || s3_config[:temp_max_size] || attachment_options[:max_size]
+          max_size = options[:max_size] || attachment_options[:temp_max_size] || attachment_options[:max_size]
 
           temp_full_filename = File.join(attachment_options[:temp_path_prefix], temp_key)
           temp_bucket.presigned_post(
@@ -402,25 +404,46 @@ module Technoweenie # :nodoc:
         # via a server-side copy_file. content_type/size are read back from S3, never
         # trusted from the caller. See README.rdoc for usage and options.
         #
-        # Deleting the temp key is best-effort: a failure there doesn't roll back an
+        # Deleting the temp key (and, when adopting onto an existing record with a changed
+        # filename, the file it replaces) is best-effort: a failure there doesn't roll back an
         # already-successful adoption (record saved, file at its permanent key) -- it's
         # logged and left for the bucket's lifecycle rule to clean up instead.
         def save_from_temp_key!(temp_key, options = {})
           was_new_record = new_record? # only destroy a row we just created, never a pre-existing one
           old_full_filename = File.join(attachment_options[:temp_path_prefix], temp_key)
           old_obj = temp_bucket.objects[old_full_filename]
-          raise TempKeyNotFoundError, "#{temp_bucket.name}/#{old_full_filename}" unless old_obj.exists?
+
+          begin
+            head = old_obj.head # one HEAD call covers the exists?/content_type/content_length checks below
+          rescue AWS::S3::Errors::NoSuchKey
+            raise TempKeyNotFoundError, "#{temp_bucket.name}/#{old_full_filename}"
+          end
 
           if attachment_options[:temp_scanner] && !attachment_options[:temp_scanner].call(old_obj)
             raise TempUploadRejectedError, old_full_filename
           end
 
           self.filename     = options[:filename]
-          self.content_type = old_obj.content_type
-          self.size         = old_obj.content_length
+          self.content_type = head[:content_type]
+          self.size         = head[:content_length]
+
+          # save! below would otherwise run the before_update :rename_file callback, copying this
+          # record's *previous* file to the new filename's key -- pointless here, since copy_file
+          # just below immediately overwrites that same key with the temp upload. Skip that copy,
+          # but still remember the previous key so we can clean it up ourselves afterwards.
+          previous_full_filename = @old_filename && File.join(base_path, @old_filename)
+          @old_filename = nil
           save!
 
           copy_file(old_full_filename, full_filename, temp_bucket)
+
+          if previous_full_filename && previous_full_filename != full_filename
+            begin
+              bucket.objects[previous_full_filename].delete
+            rescue => delete_error
+              Rails.logger.warn("attachment_fu: adopted #{old_full_filename} but failed to delete the previous file #{previous_full_filename}: #{delete_error.message}") if Rails.logger
+            end
+          end
 
           begin
             old_obj.delete
