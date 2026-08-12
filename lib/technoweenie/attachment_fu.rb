@@ -97,8 +97,9 @@ module Technoweenie # :nodoc:
         options[:thumbnail_class]  ||= self
         options[:s3_access]        ||= :public_read
         options[:cloudfront]       ||= false
-        options[:temp_path_prefix] ||= 'tmp'
-        options[:temp_expires_in]  ||= 900
+        # temp_path_prefix/temp_expires_in defaults live in S3Backend.included instead (the only
+        # backend that reads them) -- setting them here, before that runs, would permanently
+        # shadow any amazon_s3.yml-level default with this literal.
         options[:content_type] = [options[:content_type]].flatten.collect! { |t| t == :image ? ::Technoweenie::AttachmentFu.content_types : t }.flatten unless options[:content_type].nil?
         options[:cache_control]    ||= "max-age=315360000" # 10 years
 

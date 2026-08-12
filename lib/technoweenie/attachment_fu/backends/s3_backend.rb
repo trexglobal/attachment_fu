@@ -57,9 +57,16 @@ module Technoweenie # :nodoc:
       #
       # === Optional configuration parameters
       #
-      # * <tt>:server</tt> - The server to make requests to. Defaults to <tt>s3.amazonaws.com</tt>.
+      # * <tt>:server</tt> - The server to make requests to. Defaults to <tt>s3.amazonaws.com</tt>. Also
+      #     used as the actual connection endpoint (passed to the SDK as <tt>:s3_endpoint</tt>) -- pointing
+      #     this at a local S3-compatible server (e.g. minio) redirects every request there, no code change
+      #     needed. Real production configs that omit this key are unaffected.
       # * <tt>:port</tt> - The port to the requests should be made on. Defaults to 80 or 443 if <tt>:use_ssl</tt> is set.
+      #     Also used as the connection's actual port (<tt>:s3_port</tt>).
       # * <tt>:use_ssl</tt> - If set to true, <tt>:port</tt> will be implicitly set to 443, unless specified otherwise. Defaults to false.
+      # * <tt>:s3_force_path_style</tt> - Use path-style addressing (<tt>http://:server/:bucket_name/...</tt>)
+      #     instead of virtual-hosted-style. Required by most local S3-compatible servers (e.g. minio).
+      #     Defaults to false, matching real AWS S3's default.
       # * <tt>:distribution_domain</tt> - The CloudFront distribution domain for the bucket.  This can either be the assigned
       #     distribution domain (ie. XXX.cloudfront.net) or a chosen domain using a CNAME. See CloudFront for more details.
       #
@@ -166,26 +173,10 @@ module Technoweenie # :nodoc:
       #
       # === Adopting a direct-to-S3 upload
       #
-      # If your app uploads files straight from the browser to S3 (bypassing the app server),
-      # use authenticated_s3_post to issue the browser a presigned POST policy, then
-      # save_from_temp_key! to promote the resulting object into this record's canonical
-      # full_filename via a server-side copy -- no file bytes pass through the app server on
-      # either leg.
-      #
-      #   post = Photo.new.authenticated_s3_post(temp_key)
-      #   # ... browser POSTs the file straight to S3 using `post` ...
-      #   photo = Photo.new
-      #   photo.save_from_temp_key!(temp_key, :filename => params[:filename])
-      #
-      # By default the temp upload lives under the <tt>tmp/</tt> prefix in this model's own
-      # bucket. Customize this with <tt>:temp_path_prefix</tt>, <tt>:temp_bucket_name</tt>
-      # (for a distinct bucket), <tt>:temp_max_size</tt>, <tt>:temp_expires_in</tt>, and
-      # <tt>:temp_scanner</tt> (an optional callable run against the S3 object before adoption):
-      #
-      #   class Photo < ActiveRecord::Base
-      #     has_attachment :storage => :s3, :temp_bucket_name => 'appname_uploads',
-      #       :temp_max_size => 10.megabytes, :temp_expires_in => 300
-      #   end
+      # See README.rdoc, "Direct-to-S3 uploads (bypassing the app server)", for usage and
+      # the :temp_* has_attachment options -- authenticated_s3_post issues the browser a
+      # presigned POST policy, save_from_temp_key! later promotes the result via a
+      # server-side copy. No file bytes pass through the app server on either leg.
       module S3Backend
         class RequiredLibraryNotFoundError < StandardError; end
         class ConfigFileNotFoundError < StandardError; end
@@ -208,6 +199,14 @@ module Technoweenie # :nodoc:
           #  raise ConfigFileNotFoundError.new('File %s not found' % @@s3_config_path)
           end
 
+          # Precedence for all three: explicit has_attachment option on this model, then an
+          # app-wide default from amazon_s3.yml, then the gem's own literal fallback. A model that
+          # sets any of these explicitly keeps its own value -- ||= is a no-op there since
+          # self.attachment_options = options (in has_attachment) already set it before this runs.
+          base.attachment_options[:temp_bucket_name] ||= s3_config[:temp_bucket_name]
+          base.attachment_options[:temp_path_prefix] ||= s3_config[:temp_path_prefix] || 'tmp'
+          base.attachment_options[:temp_expires_in]  ||= s3_config[:temp_expires_in] || 900
+
           bucket_key = base.attachment_options[:bucket_key]
 
           if bucket_key and s3_config[bucket_key.to_sym]
@@ -217,14 +216,22 @@ module Technoweenie # :nodoc:
           end
           base.class_eval(eval_string, __FILE__, __LINE__)
 
-          if s3_config[:access_key_id]
-            @@s3_conn = AWS::S3.new(s3_config.slice(:access_key_id, :secret_access_key))
-          else
-            @@s3_conn = AWS::S3.new
-          end
-          @@bucket = s3_conn.buckets[s3_config[:bucket_name]]
+          # :server/:port/:use_ssl/:s3_force_path_style are optional -- a real production config that
+          # omits them connects exactly as before (IAM role, or explicit keys, against real AWS with
+          # SDK defaults). Setting them (e.g. to point at a local minio container) redirects the actual
+          # connection, not just the display URLs s3_protocol/s3_hostname/s3_port_string already build
+          # from these same keys.
+          # :session_token is required alongside access_key_id/secret_access_key when those are
+          # temporary credentials (STS AssumeRole, AWS SSO, etc.) rather than a permanent IAM
+          # user's static keys -- AWS rejects a temporary access_key_id with no token at all.
+          connection_options = s3_config[:access_key_id] ? s3_config.slice(:access_key_id, :secret_access_key, :session_token) : {}
+          connection_options[:s3_endpoint] = s3_config[:server] if s3_config[:server]
+          connection_options[:s3_port] = s3_config[:port] if s3_config[:port]
+          connection_options[:use_ssl] = s3_config[:use_ssl] unless s3_config[:use_ssl].nil?
+          connection_options[:s3_force_path_style] = s3_config[:s3_force_path_style] unless s3_config[:s3_force_path_style].nil?
 
-          #Base.establish_connection!(s3_config.slice(:access_key_id, :secret_access_key, :server, :port, :use_ssl, :persistent, :proxy))
+          @@s3_conn = connection_options.empty? ? AWS::S3.new : AWS::S3.new(connection_options)
+          @@bucket = s3_conn.buckets[s3_config[:bucket_name]]
 
           base.before_update :rename_file
         end
@@ -286,13 +293,7 @@ module Technoweenie # :nodoc:
           File.join(base_path, thumbnail_name_for(thumbnail))
         end
 
-        # The bucket that a temp upload (see save_from_temp_key!) is read from.
-        # Defaults to this model's own bucket. Set the <tt>:temp_bucket_name</tt>
-        # option to adopt uploads from a distinct bucket instead:
-        #
-        #   class Photo < ActiveRecord::Base
-        #     has_attachment :storage => :s3, :temp_bucket_name => 'appname_uploads'
-        #   end
+        # Bucket a temp upload is read from -- own bucket unless :temp_bucket_name is set.
         def temp_bucket
           attachment_options[:temp_bucket_name] ? s3_conn.buckets[attachment_options[:temp_bucket_name]] : bucket
         end
@@ -366,76 +367,46 @@ module Technoweenie # :nodoc:
           bucket.objects[full_filename(thumbnail)].url_for(:read, options).to_s
         end
 
-        # Issues a presigned POST policy so a browser can upload a file
-        # straight to S3, under attachment_options[:temp_path_prefix]
-        # (default "tmp") in temp_bucket -- no file bytes pass through the
-        # app server on this leg. Pair with save_from_temp_key! once the
-        # browser reports the temp_key back to the app.
+        # Presigned POST policy for a browser to upload temp_key straight to S3. See
+        # README.rdoc for usage and options.
         #
-        # The policy enforces a content-length-range fed by the
-        # <tt>:max_size</tt> option, falling back to
-        # attachment_options[:temp_max_size], falling back in turn to
-        # attachment_options[:max_size] -- the same size cap the record's
-        # own <tt>:size</tt> validation already enforces (and, like
-        # <tt>:max_size</tt> itself, always set by has_attachment, so this
-        # never ends up unbounded). There's no reason to let the dock
-        # accept something bigger than the final record would ever
-        # validate anyway.
-        #
-        # Expiry is fed by the <tt>:expires_in</tt> option, falling back to
-        # attachment_options[:temp_expires_in] (default 900 seconds).
-        #
-        #   Photo.new.authenticated_s3_post(temp_key)
-        #   Photo.new.authenticated_s3_post(temp_key, :expires_in => 300)
-        #
-        # NOTE: verify the option names below against the installed
-        # aws-sdk-v1 version's AWS::S3::Bucket#presigned_post -- this is
-        # new SDK surface for this file (everything else here only ever
-        # calls url_for/write/copy_from/read/delete).
+        # max_size falls back through :temp_max_size (this model's own option, or an app-wide
+        # default from amazon_s3.yml's temp_max_size key) to :max_size -- the dock never accepts
+        # more than the final record would validate anyway.
         def authenticated_s3_post(temp_key, options = {})
-          max_size = options[:max_size] || attachment_options[:temp_max_size] || attachment_options[:max_size]
+          max_size = options[:max_size] || attachment_options[:temp_max_size] || s3_config[:temp_max_size] || attachment_options[:max_size]
 
           temp_full_filename = File.join(attachment_options[:temp_path_prefix], temp_key)
           temp_bucket.presigned_post(
-            :key                  => temp_full_filename,
-            :content_length_range => 1..max_size,
-            :expires              => Time.now + (options[:expires_in] || attachment_options[:temp_expires_in])
+            :key             => temp_full_filename,
+            :content_length  => 1..max_size,
+            :expires         => Time.now + (options[:expires_in] || attachment_options[:temp_expires_in])
           )
         end
 
-        # Batch form of authenticated_s3_post for uploading several files at
-        # once -- issues one independently-scoped policy per temp_key (own
-        # key, own expiry; nothing shared between them). Returns a Hash of
-        # temp_key => post.
-        #
-        #   Photo.new.authenticated_s3_posts(temp_keys, :max_size => 10.megabytes)
+        # Batch form of authenticated_s3_post -- one independently-scoped policy per key.
         def authenticated_s3_posts(temp_keys, options = {})
           temp_keys.each_with_object({}) do |temp_key, posts|
             posts[temp_key] = authenticated_s3_post(temp_key, options)
           end
         end
 
-        # Promotes an already-uploaded, DB-less S3 object at temp_key --
-        # e.g. a raw key from a direct-to-S3 upload made via
-        # authenticated_s3_post -- into this record's canonical
-        # full_filename via a server-side copy_file. No file bytes pass
-        # through the app server.
+        # URL to POST an authenticated_s3_post policy's fields to -- temp_bucket, since
+        # that's what the policy was signed against. Not AWS::S3::PresignedPost#url: it
+        # never applies a custom :port, which breaks on non-default-port S3 servers (minio).
+        def authenticated_s3_post_url
+          "#{s3_protocol}#{s3_hostname}#{s3_port_string}/#{temp_bucket.name}/"
+        end
+
+        # Promotes a temp S3 object at temp_key into this record's canonical full_filename
+        # via a server-side copy_file. content_type/size are read back from S3, never
+        # trusted from the caller. See README.rdoc for usage and options.
         #
-        # temp_key is relative to attachment_options[:temp_path_prefix]
-        # and is read from temp_bucket, which may be a distinct bucket
-        # from this model's own (see temp_bucket). content_type and size
-        # are always read back from S3 rather than trusted from the
-        # caller.
-        #
-        # Once the copy succeeds, the temp key is deleted best-effort: a
-        # delete failure at that point doesn't roll back an otherwise
-        # successful adoption (the record's saved and the file's at its
-        # permanent key) -- it's logged and left for the bucket's
-        # lifecycle rule to clean up instead.
-        #
-        #   photo = Photo.new
-        #   photo.save_from_temp_key!(params[:temp_key], :filename => params[:filename])
+        # Deleting the temp key is best-effort: a failure there doesn't roll back an
+        # already-successful adoption (record saved, file at its permanent key) -- it's
+        # logged and left for the bucket's lifecycle rule to clean up instead.
         def save_from_temp_key!(temp_key, options = {})
+          was_new_record = new_record? # only destroy a row we just created, never a pre-existing one
           old_full_filename = File.join(attachment_options[:temp_path_prefix], temp_key)
           old_obj = temp_bucket.objects[old_full_filename]
           raise TempKeyNotFoundError, "#{temp_bucket.name}/#{old_full_filename}" unless old_obj.exists?
@@ -459,7 +430,7 @@ module Technoweenie # :nodoc:
 
           true
         rescue
-          destroy
+          destroy if was_new_record # an update on failure keeps the existing record intact
           raise
         end
 

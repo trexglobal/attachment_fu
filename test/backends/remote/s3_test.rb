@@ -1,5 +1,7 @@
 require File.expand_path(File.join(File.dirname(__FILE__), '..', '..', 'test_helper'))
 require 'net/http'
+require 'base64'
+require 'json'
 
 class S3Test < Test::Unit::TestCase
   def self.test_S3?
@@ -138,14 +140,18 @@ class S3Test < Test::Unit::TestCase
 
     test_against_subclass :test_should_raise_when_temp_key_missing, S3Attachment
 
-    # NOTE: exercises new SDK surface (AWS::S3::Bucket#presigned_post) that
-    # nothing else in this file calls -- if this fails, check the installed
-    # aws-sdk-v1 version's presigned_post option names first.
     def test_should_create_authenticated_s3_post(klass = S3Attachment)
       attachment_model klass
       temp_key = "test-post-#{Process.pid}-#{rand(1_000_000)}"
-      post = attachment_model.new.authenticated_s3_post(temp_key, :max_size => 5.megabytes)
+      max_size = 5.megabytes
+      post = attachment_model.new.authenticated_s3_post(temp_key, :max_size => max_size)
       assert post, "authenticated_s3_post returned nil"
+
+      conditions = JSON.parse(Base64.decode64(post.fields['policy']))['conditions']
+      length_range = conditions.find { |c| c.is_a?(Array) && c[0] == 'content-length-range' }
+      assert length_range, "policy conditions should include a content-length-range condition: #{conditions.inspect}"
+      assert_equal [1, max_size], length_range[1, 2],
+        "content-length-range condition should enforce the requested max_size"
     end
 
     test_against_subclass :test_should_create_authenticated_s3_post, S3Attachment
