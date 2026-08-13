@@ -404,6 +404,12 @@ module Technoweenie # :nodoc:
         # via a server-side copy_file. content_type/size are read back from S3, never
         # trusted from the caller. See README.rdoc for usage and options.
         #
+        # A missing temp_key (TempKeyNotFoundError) isn't necessarily caller error -- the object
+        # can legitimately be gone by the time this runs: an expired/already-adopted key, a
+        # lifecycle rule, a prior rejection by temp_scanner (see below), or an out-of-band
+        # malware/virus scan that deleted it before adoption. Either way, any failure here is
+        # logged before being re-raised so it's visible in production regardless of cause.
+        #
         # Deleting the temp key (and, when adopting onto an existing record with a changed
         # filename, the file it replaces) is best-effort: a failure there doesn't roll back an
         # already-successful adoption (record saved, file at its permanent key) -- it's
@@ -420,6 +426,14 @@ module Technoweenie # :nodoc:
           end
 
           if attachment_options[:temp_scanner] && !attachment_options[:temp_scanner].call(old_obj)
+            # Don't leave a rejected (e.g. malware-flagged) object sitting in the bucket for the
+            # lifecycle rule to eventually catch -- delete it now. Best-effort: a delete failure
+            # here shouldn't change the outcome (still rejected either way), just get logged.
+            begin
+              old_obj.delete
+            rescue => delete_error
+              Rails.logger.warn("attachment_fu: rejected #{old_full_filename} (failed temp_scanner) but failed to delete it: #{delete_error.message}") if Rails.logger
+            end
             raise TempUploadRejectedError, old_full_filename
           end
 
@@ -452,7 +466,8 @@ module Technoweenie # :nodoc:
           end
 
           true
-        rescue
+        rescue => e
+          Rails.logger.warn("attachment_fu: save_from_temp_key! failed for #{temp_bucket.name}/#{old_full_filename}: #{e.class}: #{e.message}") if Rails.logger
           destroy if was_new_record # an update on failure keeps the existing record intact
           raise
         end
