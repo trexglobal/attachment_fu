@@ -458,8 +458,9 @@ the gem's own literal default applies.
 [:temp_scanner]
     Optional callable invoked with the temp S3 object before promotion (e.g.
     for a malware/virus scan). If it returns false, promotion is aborted with
-    <tt>Technoweenie::AttachmentFu::Backends::S3Backend::TempUploadRejectedError</tt>.
-    No-op by default.
+    <tt>Technoweenie::AttachmentFu::Backends::S3Backend::TempUploadRejectedError</tt>,
+    and the rejected object is deleted from the temp bucket rather than left for
+    the lifecycle rule to eventually catch. No-op by default.
 
 Example:
 

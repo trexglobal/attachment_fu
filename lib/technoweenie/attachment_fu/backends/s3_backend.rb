@@ -57,16 +57,14 @@ module Technoweenie # :nodoc:
       #
       # === Optional configuration parameters
       #
-      # * <tt>:server</tt> - The server to make requests to. Defaults to <tt>s3.amazonaws.com</tt>. Also
-      #     used as the actual connection endpoint (passed to the SDK as <tt>:s3_endpoint</tt>) -- pointing
-      #     this at a local S3-compatible server (e.g. minio) redirects every request there, no code change
-      #     needed. Real production configs that omit this key are unaffected.
+      # * <tt>:server</tt> - The server to make requests to. Defaults to <tt>s3.amazonaws.com</tt>. Also sets
+      #     the SDK's actual connection endpoint (<tt>:s3_endpoint</tt>) -- point this at a local S3-compatible
+      #     server (e.g. minio) to redirect every request there.
       # * <tt>:port</tt> - The port to the requests should be made on. Defaults to 80 or 443 if <tt>:use_ssl</tt> is set.
-      #     Also used as the connection's actual port (<tt>:s3_port</tt>).
+      #     Also sets the connection's actual port (<tt>:s3_port</tt>).
       # * <tt>:use_ssl</tt> - If set to true, <tt>:port</tt> will be implicitly set to 443, unless specified otherwise. Defaults to false.
       # * <tt>:s3_force_path_style</tt> - Use path-style addressing (<tt>http://:server/:bucket_name/...</tt>)
       #     instead of virtual-hosted-style. Required by most local S3-compatible servers (e.g. minio).
-      #     Defaults to false, matching real AWS S3's default.
       # * <tt>:distribution_domain</tt> - The CloudFront distribution domain for the bucket.  This can either be the assigned
       #     distribution domain (ie. XXX.cloudfront.net) or a chosen domain using a CNAME. See CloudFront for more details.
       #
@@ -201,9 +199,7 @@ module Technoweenie # :nodoc:
 
           # Precedence for all four: explicit has_attachment option on this model, then an
           # app-wide default from amazon_s3.yml, then the gem's own literal fallback (none for
-          # temp_bucket_name/temp_max_size). A model that sets any of these explicitly keeps its
-          # own value -- ||= is a no-op there since self.attachment_options = options (in
-          # has_attachment) already set it before this runs.
+          # temp_bucket_name/temp_max_size).
           base.attachment_options[:temp_bucket_name] ||= s3_config[:temp_bucket_name]
           base.attachment_options[:temp_path_prefix] ||= s3_config[:temp_path_prefix] || 'tmp'
           base.attachment_options[:temp_expires_in]  ||= s3_config[:temp_expires_in] || 900
@@ -218,14 +214,10 @@ module Technoweenie # :nodoc:
           end
           base.class_eval(eval_string, __FILE__, __LINE__)
 
-          # :server/:port/:use_ssl/:s3_force_path_style are optional -- a real production config that
-          # omits them connects exactly as before (IAM role, or explicit keys, against real AWS with
-          # SDK defaults). Setting them (e.g. to point at a local minio container) redirects the actual
-          # connection, not just the display URLs s3_protocol/s3_hostname/s3_port_string already build
-          # from these same keys.
-          # :session_token is required alongside access_key_id/secret_access_key when those are
-          # temporary credentials (STS AssumeRole, AWS SSO, etc.) rather than a permanent IAM
-          # user's static keys -- AWS rejects a temporary access_key_id with no token at all.
+          # :server/:port/:use_ssl/:s3_force_path_style are optional -- omitted, they connect
+          # exactly as before (IAM role or explicit keys, against real AWS with SDK defaults).
+          # :session_token is needed alongside access_key_id/secret_access_key when those are
+          # temporary credentials (STS AssumeRole, AWS SSO) rather than a permanent IAM user's keys.
           connection_options = s3_config[:access_key_id] ? s3_config.slice(:access_key_id, :secret_access_key, :session_token) : {}
           connection_options[:s3_endpoint] = s3_config[:server] if s3_config[:server]
           connection_options[:s3_port] = s3_config[:port] if s3_config[:port]
@@ -379,11 +371,16 @@ module Technoweenie # :nodoc:
           max_size = options[:max_size] || attachment_options[:temp_max_size] || attachment_options[:max_size]
 
           temp_full_filename = File.join(attachment_options[:temp_path_prefix], temp_key)
-          temp_bucket.presigned_post(
+          post_options = {
             :key             => temp_full_filename,
             :content_length  => 1..max_size,
             :expires         => Time.now + (options[:expires_in] || attachment_options[:temp_expires_in])
-          )
+          }
+          # Pins Content-Type to an exact value so S3 rejects a POST that doesn't match.
+          # Optional: omitting it preserves prior behavior (uncovered field, object stored
+          # as application/octet-stream).
+          post_options[:content_type] = options[:content_type] if options[:content_type]
+          temp_bucket.presigned_post(post_options)
         end
 
         # Batch form of authenticated_s3_post -- one independently-scoped policy per key.
@@ -403,6 +400,9 @@ module Technoweenie # :nodoc:
         # Promotes a temp S3 object at temp_key into this record's canonical full_filename
         # via a server-side copy_file. content_type/size are read back from S3, never
         # trusted from the caller. See README.rdoc for usage and options.
+        #
+        # If this attachment is thumbnailable? and has thumbnails configured, also downloads
+        # the promoted object once and generates them (see generate_thumbnails!), best-effort.
         #
         # A missing temp_key (TempKeyNotFoundError) isn't necessarily caller error -- the object
         # can legitimately be gone by the time this runs: an expired/already-adopted key, a
@@ -443,13 +443,39 @@ module Technoweenie # :nodoc:
 
           # save! below would otherwise run the before_update :rename_file callback, copying this
           # record's *previous* file to the new filename's key -- pointless here, since copy_file
-          # just below immediately overwrites that same key with the temp upload. Skip that copy,
-          # but still remember the previous key so we can clean it up ourselves afterwards.
+          # overwrites that same key with the temp upload anyway. Skip that copy, but still
+          # remember the previous key so we can clean it up ourselves afterwards.
           previous_full_filename = @old_filename && File.join(base_path, @old_filename)
           @old_filename = nil
-          save!
 
-          copy_file(old_full_filename, full_filename, temp_bucket)
+          if was_new_record
+            # full_filename/base_path need this record's id, which only exists once saved.
+            # A failed copy_file below then leaves a persisted row with no object at its key --
+            # fine, since it's a row we just created and the rescue below destroys it.
+            save!
+            copy_file(old_full_filename, full_filename, temp_bucket)
+          else
+            # An existing record already has an id, so copy before save! instead: a failed
+            # copy then leaves the still-good previous file (and the record pointing at it)
+            # untouched, rather than persisting metadata for a file that was never written.
+            #
+            # Validate first too -- full_filename is this record's permanent path, not the
+            # temp key, so nothing would sweep an object left there by a copy that succeeded
+            # right before save! failed validation.
+            valid? || raise(ActiveRecord::RecordInvalid.new(self))
+            copy_file(old_full_filename, full_filename, temp_bucket)
+            save!
+          end
+
+          # Best-effort: a thumbnail failure must never undo an already-successful claim,
+          # so it's caught and logged here rather than re-raised.
+          if respond_to?(:process_attachment_with_processing, true) && thumbnailable? && !attachment_options[:thumbnails].blank?
+            begin
+              generate_thumbnails!(create_temp_file)
+            rescue => thumbnail_error
+              Rails.logger.warn("attachment_fu: save_from_temp_key! thumbnail generation failed for #{full_filename}: #{thumbnail_error.class}: #{thumbnail_error.message}") if Rails.logger
+            end
+          end
 
           if previous_full_filename && previous_full_filename != full_filename
             begin

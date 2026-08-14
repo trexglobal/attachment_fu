@@ -175,7 +175,45 @@ class S3Test < Test::Unit::TestCase
 
     test_against_subclass :test_authenticated_s3_post_falls_back_to_attachment_max_size, S3Attachment
 
+    def test_authenticated_s3_post_pins_content_type_when_given(klass = S3Attachment)
+      attachment_model klass
+      post = attachment_model.new.authenticated_s3_post('some-temp-key', :content_type => 'image/png')
+
+      condition = content_type_condition(post)
+      assert condition, "policy conditions should pin Content-Type when :content_type is given: #{policy_conditions(post).inspect}"
+      assert_equal 'image/png', content_type_condition_value(condition)
+    end
+
+    test_against_subclass :test_authenticated_s3_post_pins_content_type_when_given, S3Attachment
+
+    def test_authenticated_s3_post_leaves_content_type_uncovered_by_default(klass = S3Attachment)
+      attachment_model klass
+      post = attachment_model.new.authenticated_s3_post('some-temp-key')
+
+      assert_nil content_type_condition(post),
+        "policy conditions should not cover Content-Type unless :content_type is given: #{policy_conditions(post).inspect}"
+    end
+
+    test_against_subclass :test_authenticated_s3_post_leaves_content_type_uncovered_by_default, S3Attachment
+
     protected
+      def policy_conditions(post)
+        JSON.parse(Base64.decode64(post.fields['policy']))['conditions']
+      end
+
+      # aws-sdk-v1 emits an equality condition either as a Hash ({"Content-Type" => value})
+      # or as an ["eq", "$Content-Type", value] Array, per the S3 POST policy spec.
+      def content_type_condition(post)
+        policy_conditions(post).find do |c|
+          (c.is_a?(Hash) && c.key?('Content-Type')) ||
+            (c.is_a?(Array) && c[0] == 'eq' && c[1] == '$Content-Type')
+        end
+      end
+
+      def content_type_condition_value(condition)
+        condition.is_a?(Hash) ? condition['Content-Type'] : condition[2]
+      end
+
       def http_response_for(url)
         url = URI.parse(url)
         Net::HTTP.start(url.host, url.port) {|http| http.request_head(url.path) }
