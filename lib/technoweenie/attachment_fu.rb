@@ -97,6 +97,9 @@ module Technoweenie # :nodoc:
         options[:thumbnail_class]  ||= self
         options[:s3_access]        ||= :public_read
         options[:cloudfront]       ||= false
+        # temp_path_prefix/temp_expires_in defaults live in S3Backend.included instead (the only
+        # backend that reads them) -- setting them here, before that runs, would permanently
+        # shadow any amazon_s3.yml-level default with this literal.
         options[:content_type] = [options[:content_type]].flatten.collect! { |t| t == :image ? ::Technoweenie::AttachmentFu.content_types : t }.flatten unless options[:content_type].nil?
         options[:cache_control]    ||= "max-age=315360000" # 10 years
 
@@ -497,27 +500,33 @@ module Technoweenie # :nodoc:
           @saved_attachment = save_attachment?
         end
 
+        # Generates every configured thumbnail from temp_file. Shared by after_process_attachment
+        # and S3Backend#save_from_temp_key!, which each arrive at a local temp_file differently.
+        def generate_thumbnails!(temp_file)
+          attachment_options[:thumbnails].each { |suffix, size|
+            if size.is_a?(Symbol)
+              parent_type = polymorphic_parent_type
+              next unless parent_type && [parent_type, parent_type.tableize].include?(suffix.to_s) && respond_to?(size)
+              size = send(size)
+            end
+            if size.is_a?(Hash)
+              parent_type = polymorphic_parent_type
+              next unless parent_type && [parent_type, parent_type.tableize].include?(suffix.to_s)
+              size.each { |ppt_suffix, ppt_size|
+                create_or_update_thumbnail(temp_file, ppt_suffix, *ppt_size)
+              }
+            else
+              create_or_update_thumbnail(temp_file, suffix, *size)
+            end
+          }
+        end
+
         # Cleans up after processing.  Thumbnails are created, the attachment is stored to the backend, and the temp_paths are cleared.
         def after_process_attachment
           if @saved_attachment
             if respond_to?(:process_attachment_with_processing, true) && thumbnailable? && !attachment_options[:thumbnails].blank? && parent_id.nil?
               temp_file = temp_path || create_temp_file
-              attachment_options[:thumbnails].each { |suffix, size|
-                if size.is_a?(Symbol)
-                  parent_type = polymorphic_parent_type
-                  next unless parent_type && [parent_type, parent_type.tableize].include?(suffix.to_s) && respond_to?(size)
-                  size = send(size)
-                end
-                if size.is_a?(Hash)
-                  parent_type = polymorphic_parent_type
-                  next unless parent_type && [parent_type, parent_type.tableize].include?(suffix.to_s)
-                  size.each { |ppt_suffix, ppt_size|
-                    create_or_update_thumbnail(temp_file, ppt_suffix, *ppt_size)
-                  }
-                else
-                  create_or_update_thumbnail(temp_file, suffix, *size)
-                end
-              }
+              generate_thumbnails!(temp_file)
             end
             save_to_storage
             @temp_paths.clear

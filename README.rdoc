@@ -352,3 +352,123 @@ example shows how to upload a file from a script.
         uploaded_data: ActionController::TestUploadedFile.new(path, mimetype)
     )
     @attachable.save
+
+= Direct-to-S3 uploads (bypassing the app server)
+
+S3-backed models (+:storage => :s3+) can also adopt a file that was uploaded
+straight from the browser to S3, rather than through the app server. This is
+useful for large files or high upload volume, since file bytes never pass
+through the app server on either leg: the browser uploads directly to a
+temporary key, and the record adopts it later via a server-side S3 copy.
+
+The flow has two steps:
+
+1. The app server issues a presigned POST policy for a temporary key. The
+   browser POSTs the file straight to S3 using that policy.
+2. Once the browser reports the resulting key back to the app (e.g. as a
+   hidden form field), the app creates or updates the record and promotes
+   the temporary object into the record's canonical location.
+
+== authenticated_s3_post(temp_key, options = {})
+
+Issues a presigned POST policy for +temp_key+, scoped under the model's
++:temp_path_prefix+ (in +temp_bucket+, see options below). The browser uses
+the returned policy to POST the file directly to S3.
+
+[:max_size]
+    Maximum upload size in bytes, fed into the policy's
+    +content-length-range+ condition. Falls back to +:temp_max_size+, then to
+    the model's own +:max_size+ (so the dock never accepts a file bigger than
+    the final record would validate anyway).
+
+[:expires_in]
+    How long, in seconds, the policy itself stays valid for the browser to
+    use. Falls back to +:temp_expires_in+ (default 900). This is separate
+    from any bucket lifecycle/expiration rule on the temp key itself -- it
+    bounds how long the signed authorization can be used, not how long the
+    resulting object lives once uploaded.
+
+Example:
+
+    photo = Photo.new
+    post  = photo.authenticated_s3_post(temp_key)
+    url   = photo.authenticated_s3_post_url
+    # ... browser POSTs `post.fields` as form fields to `url` ...
+
+Use +authenticated_s3_post_url+ for the POST target, not <tt>post.url</tt> --
+the latter never applies a custom port.
+
+== authenticated_s3_post_url
+
+The URL to POST an +authenticated_s3_post+ policy's fields to.
+
+== authenticated_s3_posts(temp_keys, options = {})
+
+Batch form of +authenticated_s3_post+ for uploading several files at once.
+Issues one independently-scoped policy per key and returns a Hash of
+<tt>temp_key => post</tt>.
+
+    posts = Photo.new.authenticated_s3_posts(temp_keys, max_size: 10.megabytes)
+
+== save_from_temp_key!(temp_key, options = {})
+
+Promotes an already-uploaded, DB-less S3 object at +temp_key+ into this
+record's canonical location via a server-side copy -- no file bytes pass
+through the app server. +content_type+ and +size+ are always read back from
+S3 rather than trusted from the caller. Raises
+<tt>Technoweenie::AttachmentFu::Backends::S3Backend::TempKeyNotFoundError</tt>
+if the temp key doesn't exist.
+
+[:filename]
+    Filename to save the record with.
+
+Example:
+
+    photo = Photo.new
+    photo.save_from_temp_key!(params[:temp_key], filename: params[:filename])
+
+== has_attachment options for direct-to-S3 uploads
+
+These extend the +has_attachment+ options listed above, and only apply when
++:storage+ is +:s3+.
+
+All four of the following share the same precedence: an explicit has_attachment
+option on this model always wins; otherwise each falls back to the matching key
+in amazon_s3.yml (one app-wide default, no config repeated per model); otherwise
+the gem's own literal default applies.
+
+[:temp_path_prefix]
+    Prefix the temporary key lives under, in the same bucket as the final
+    attachment by default. Defaults to <tt>'tmp'</tt>.
+
+[:temp_bucket_name]
+    Use a distinct bucket for temporary uploads instead of the model's own
+    bucket (e.g. one shared intake bucket across several apps). No literal
+    default -- unset everywhere falls back to the model's own bucket.
+
+[:temp_max_size]
+    Maximum size, in bytes, allowed for a direct-to-S3 upload. No literal
+    default of its own -- falls back to <tt>:max_size</tt> if unset here and
+    in amazon_s3.yml.
+
+[:temp_expires_in]
+    How long, in seconds, an issued upload policy remains valid. Defaults to
+    900 (15 minutes).
+
+[:temp_scanner]
+    Optional callable invoked with the temp S3 object before promotion (e.g.
+    for a malware/virus scan). If it returns false, promotion is aborted with
+    <tt>Technoweenie::AttachmentFu::Backends::S3Backend::TempUploadRejectedError</tt>,
+    and the rejected object is deleted from the temp bucket rather than left for
+    the lifecycle rule to eventually catch. No-op by default.
+
+Example:
+
+    class Photo < ActiveRecord::Base
+      has_attachment(
+          storage: :s3,
+          temp_bucket_name: 'appname_uploads',
+          temp_max_size: 10.megabytes,
+          temp_expires_in: 300
+      )
+    end
